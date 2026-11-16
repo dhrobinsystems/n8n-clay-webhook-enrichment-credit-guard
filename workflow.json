@@ -1,0 +1,1252 @@
+{
+  "name": "n8n-clay-webhook-enrichment-credit-guard",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hubspot-clay-credit-guard",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "b6e8fd14-35a0-52d3-9886-d5ed33c6ce1f",
+      "name": "HubSpot Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000a1",
+      "notes": "Receives HubSpot Workflow 'Send a webhook' calls or Webhooks API event arrays for companies and contacts. Pinned fictional fixtures are attached for SANDBOX_MODE testing."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Parse & Authenticate Events          Mode: Run Once for All Items\n// Repo: n8n-clay-webhook-enrichment-credit-guard · dhRobin Systems\n// Purpose: authenticate each inbound HubSpot call, normalise both payload\n// shapes (Workflow \"Send a webhook\" action and Webhooks API event arrays)\n// into one item per HubSpot object, and drop secrets/headers from the data.\n// ─────────────────────────────────────────────────────────────────────\nconst helpers = this.helpers;\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\n\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // anything unrecognised falls back to the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst AUTH_MODE = env('WEBHOOK_AUTH_MODE', 'shared_secret').toLowerCase(); // shared_secret | hubspot_v3\nconst SECRET_HEADER = env('WEBHOOK_SECRET_HEADER', 'x-webhook-secret').toLowerCase();\nconst SANDBOX_FIXTURE_SECRET = 'sandbox-fictional-secret-not-for-production';\nconst CONFIGURED_SECRET = env('WEBHOOK_SHARED_SECRET', '');\nconst EXPECTED_SECRET = CONFIGURED_SECRET || (SANDBOX_MODE ? SANDBOX_FIXTURE_SECRET : '');\nconst ALWAYS_FETCH_RECORD = flag('ALWAYS_FETCH_RECORD', true);\nconst MAX_EVENTS = Math.max(1, num('MAX_EVENTS_PER_EXECUTION', 50));\nconst WATCHED_PROPERTIES = new Set(\n  env('WATCHED_PROPERTY_CHANGES', 'domain,website,email').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)\n);\nconst ACCEPTED_ACTIONS = new Set(['creation', 'propertychange']);\n\nconst newRunId = () => {\n  try { if (crypto && crypto.randomUUID) return 'gate_' + crypto.randomUUID(); } catch (error) { /* fall through */ }\n  return 'gate_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);\n};\n\nconst lowerHeaders = (headers) => {\n  const out = {};\n  for (const [k, v] of Object.entries(headers || {})) out[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  return out;\n};\n\n// Constant-time comparison: hash both sides first so lengths never leak.\nconst safeEqual = (a, b) => {\n  if (typeof a !== 'string' || typeof b !== 'string' || a === '' || b === '') return false;\n  if (crypto) {\n    const ha = crypto.createHash('sha256').update(a, 'utf8').digest();\n    const hb = crypto.createHash('sha256').update(b, 'utf8').digest();\n    return crypto.timingSafeEqual(ha, hb);\n  }\n  let diff = a.length ^ b.length;\n  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);\n  return diff === 0;\n};\n\nasync function readRawBody(item, index) {\n  if (!item.binary || !item.binary.data) return null;\n  try {\n    const buffer = await helpers.getBinaryDataBuffer(index, 'data');\n    return buffer.toString('utf8');\n  } catch (error) {\n    return null;\n  }\n}\n\nasync function authenticate(item, headers, rawBody) {\n  if (AUTH_MODE === 'hubspot_v3') {\n    const clientSecret = env('HUBSPOT_APP_CLIENT_SECRET', '');\n    const publicUrl = env('HUBSPOT_WEBHOOK_PUBLIC_URL', '');\n    if (!crypto || !clientSecret || !publicUrl) return { ok: false, method: 'hubspot_v3', reason: 'hubspot_v3_not_configured' };\n    const provided = headers['x-hubspot-signature-v3'];\n    const timestamp = headers['x-hubspot-request-timestamp'];\n    if (!provided || !timestamp) return { ok: false, method: 'hubspot_v3', reason: 'hubspot_v3_headers_missing' };\n    const skew = Math.abs(Date.now() - Number(timestamp));\n    if (!Number.isFinite(skew) || skew > 5 * 60 * 1000) return { ok: false, method: 'hubspot_v3', reason: 'hubspot_v3_timestamp_out_of_window' };\n    const body = rawBody !== null ? rawBody : JSON.stringify(item.json.body ?? '');\n    const expected = crypto.createHmac('sha256', clientSecret).update(`POST${publicUrl}${body}${timestamp}`, 'utf8').digest('base64');\n    return safeEqual(expected, String(provided))\n      ? { ok: true, method: 'hubspot_v3' }\n      : { ok: false, method: 'hubspot_v3', reason: 'hubspot_v3_signature_mismatch' };\n  }\n  if (!EXPECTED_SECRET) return { ok: false, method: 'shared_secret', reason: 'shared_secret_not_configured' };\n  const provided = headers[SECRET_HEADER] || '';\n  if (!safeEqual(provided, EXPECTED_SECRET)) return { ok: false, method: 'shared_secret', reason: 'shared_secret_mismatch' };\n  return { ok: true, method: CONFIGURED_SECRET ? 'shared_secret' : 'sandbox_fixture_secret' };\n}\n\n// Accepts { prop: \"value\" } and legacy { prop: { value: \"...\" } } shapes.\nconst flattenProperties = (props) => {\n  const out = {};\n  if (!props || typeof props !== 'object' || Array.isArray(props)) return out;\n  for (const [k, v] of Object.entries(props)) {\n    let value = v;\n    if (value && typeof value === 'object' && !Array.isArray(value) && 'value' in value) value = value.value;\n    if (value === undefined) continue;\n    out[String(k).toLowerCase()] = value === null ? null : typeof value === 'object' ? JSON.stringify(value) : String(value);\n  }\n  return out;\n};\n\n// Sandbox fixtures can say \"SANDBOX_DAYS_AGO:12\" so cooldown tests never go stale.\nconst resolveSandboxValues = (props) => {\n  if (!SANDBOX_MODE) return props;\n  for (const [k, v] of Object.entries(props)) {\n    const match = typeof v === 'string' ? v.match(/^SANDBOX_DAYS_AGO:(\\d{1,4})$/) : null;\n    if (match) props[k] = new Date(Date.now() - Number(match[1]) * 86400000).toISOString();\n  }\n  return props;\n};\n\nconst resolveObjectType = (raw, props = {}, query = {}) => {\n  for (const candidate of [raw, query.objectType, query.object_type]) {\n    const v = String(candidate || '').toLowerCase().trim();\n    if (['company', 'companies', '0-2'].includes(v)) return 'company';\n    if (['contact', 'contacts', '0-1'].includes(v)) return 'contact';\n  }\n  if (props.email) return 'contact';\n  if (props.domain || props.website) return 'company';\n  return null;\n};\n\nconst toIso = (value, fallback) => {\n  if (value === undefined || value === null || value === '') return fallback;\n  const n = /^\\d+$/.test(String(value)) ? Number(value) : Date.parse(String(value));\n  return Number.isFinite(n) ? new Date(n).toISOString() : fallback;\n};\n\nconst output = [];\nconst items = $input.all();\n\nfor (let index = 0; index < items.length; index++) {\n  const item = items[index];\n  const receivedAt = new Date().toISOString();\n  const headers = lowerHeaders(item.json.headers);\n  const query = item.json.query || {};\n  const rawBody = await readRawBody(item, index);\n\n  let body = item.json.body;\n  if ((body === undefined || body === null || body === '' || (typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 0)) && rawBody) {\n    try { body = JSON.parse(rawBody); } catch (error) { body = null; }\n  }\n  if (typeof body === 'string') {\n    try { body = JSON.parse(body); } catch (error) { /* left as string -> rejected below */ }\n  }\n\n  const runId = newRunId();\n  const auth = await authenticate(item, headers, rawBody);\n  const baseGate = {\n    runId,\n    receivedAt,\n    sandboxMode: SANDBOX_MODE,\n    dryRun: DRY_RUN,\n    authOk: auth.ok,\n    authMethod: auth.method,\n    webhookCallIndex: index,\n  };\n\n  if (!auth.ok) {\n    // Nothing from an unauthenticated body is carried forward.\n    output.push({ json: { gate: { ...baseGate, payloadShape: 'not_parsed', eventType: null, rejectReason: auth.reason }, objectType: null, objectId: null, properties: null, needsFetch: false } });\n    continue;\n  }\n\n  const events = [];\n  if (Array.isArray(body)) {\n    for (const ev of body) {\n      const subscription = String((ev && ev.subscriptionType) || '');\n      const [typePart, actionPart] = subscription.toLowerCase().split('.');\n      const objectType = resolveObjectType(typePart);\n      const base = {\n        shape: 'hubspot_webhooks_api',\n        objectType,\n        objectId: ev && ev.objectId != null ? String(ev.objectId) : null,\n        eventType: subscription || null,\n        eventId: ev && ev.eventId != null ? String(ev.eventId) : null,\n        occurredAt: toIso(ev && ev.occurredAt, receivedAt),\n        properties: null,\n      };\n      if (!objectType || !ACCEPTED_ACTIONS.has(actionPart || '')) { events.push({ ...base, ignoreReason: 'unsupported_event_type' }); continue; }\n      if (actionPart === 'propertychange' && !WATCHED_PROPERTIES.has(String(ev.propertyName || '').toLowerCase())) {\n        events.push({ ...base, ignoreReason: 'unwatched_property_change' });\n        continue;\n      }\n      events.push(base);\n    }\n  } else if (body && typeof body === 'object') {\n    // \"Include all properties\" bodies nest under `properties`; customised bodies are flat key/value pairs.\n    const propertySource = body.properties && typeof body.properties === 'object' ? body.properties : body;\n    const props = resolveSandboxValues(flattenProperties(propertySource));\n    for (const meta of ['objecttype', 'objectid', 'eventtype', 'eventid', 'occurredat', 'fixturenote']) delete props[meta];\n    const rawId = body.objectId ?? body.hs_object_id ?? props.hs_object_id ?? body.vid ?? body.companyId ?? body.id;\n    events.push({\n      shape: 'hubspot_workflow_webhook',\n      objectType: resolveObjectType(body.objectType, props, query),\n      objectId: rawId != null ? String(rawId) : null,\n      eventType: String(body.eventType || 'workflow.enrollment'),\n      eventId: body.eventId != null ? String(body.eventId) : null,\n      occurredAt: toIso(body.occurredAt, receivedAt),\n      properties: Object.keys(props).length ? props : null,\n    });\n  } else {\n    events.push({ shape: 'unknown', objectType: null, objectId: null, eventType: null, eventId: null, occurredAt: receivedAt, properties: null, rejectReason: 'empty_or_unparseable_body' });\n  }\n\n  if (events.length === 0) {\n    events.push({ shape: 'hubspot_webhooks_api', objectType: null, objectId: null, eventType: null, eventId: null, occurredAt: receivedAt, properties: null, rejectReason: 'no_events_in_payload' });\n  }\n\n  const seen = new Set();\n  let accepted = 0;\n  for (const ev of events) {\n    const key = `${ev.objectType}:${ev.objectId}`;\n    if (!ev.ignoreReason && !ev.rejectReason) {\n      if (ev.objectType && ev.objectId && seen.has(key)) ev.ignoreReason = 'duplicate_event_in_payload';\n      else if (accepted >= MAX_EVENTS) ev.ignoreReason = 'max_events_per_execution_exceeded';\n      else { seen.add(key); accepted++; }\n    }\n    const eligible = !ev.ignoreReason && !ev.rejectReason && !!ev.objectId && !!ev.objectType;\n    output.push({\n      json: {\n        gate: {\n          ...baseGate,\n          payloadShape: ev.shape,\n          eventType: ev.eventType,\n          eventId: ev.eventId,\n          occurredAt: ev.occurredAt,\n          ignoreReason: ev.ignoreReason || null,\n          rejectReason: ev.rejectReason || null,\n        },\n        objectType: ev.objectType,\n        objectId: ev.objectId,\n        properties: ev.properties,\n        needsFetch: eligible && !SANDBOX_MODE && (ALWAYS_FETCH_RECORD || !ev.properties),\n      },\n    });\n  }\n}\n\nreturn output;\n"
+      },
+      "id": "02f70e63-a687-502d-ac57-96444c97acc4",
+      "name": "Parse & Authenticate Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "Shared-secret (default) or HubSpot v3 signature check. Splits payloads into one item per object.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cc326ae7-49d5-5313-82f2-3945d698691d",
+              "leftValue": "={{ $json.needsFetch }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fced627a-cf5e-58d4-b97b-36997d22abf2",
+      "name": "Needs Record Fetch?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com') }}/crm/v3/objects/{{ $json.objectType === 'contact' ? 'contacts' : 'companies' }}/{{ encodeURIComponent($json.objectId) }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "properties",
+              "value": "={{ $json.objectType === 'contact' ? 'email,hs_email_domain,firstname,lastname,company,jobtitle,numemployees,industry,country,clay_enrichment_status,clay_last_enriched_at,clay_last_dispatched_at' : 'domain,website,name,numberofemployees,industry,country,clay_enrichment_status,clay_last_enriched_at,clay_last_dispatched_at' }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "id": "965264cf-9a24-58bc-9f75-15c472707971",
+      "name": "Fetch HubSpot Record",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "notes": "GET the fresh CRM record. Never Error is on so 404/429 reach the merge node as data."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Merge Fetched Record                 Mode: Run Once for Each Item\n// Merges the fresh HubSpot CRM record into the event item. CRM values win\n// over inline webhook values unless the CRM value is empty.\n// ─────────────────────────────────────────────────────────────────────\nconst original = $('Needs Record Fetch?').item.json;\nconst response = $json || {};\nconst statusCode = Number(response.statusCode || 0);\n\nconst errorText = (r) => {\n  const e = r.error;\n  const raw = (r.body && (r.body.message || r.body.category)) || (e && (e.message || e.description)) || (typeof e === 'string' ? e : '') || 'unknown_error';\n  return String(raw)\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .slice(0, 300);\n};\n\nif (statusCode === 200 && response.body && response.body.properties) {\n  const merged = { ...(original.properties || {}) };\n  for (const [k, v] of Object.entries(response.body.properties)) {\n    if (v !== null && v !== undefined && v !== '') merged[k.toLowerCase()] = String(v);\n    else if (!(k.toLowerCase() in merged)) merged[k.toLowerCase()] = null;\n  }\n  return { json: { ...original, properties: merged, needsFetch: false, recordFetch: { ok: true, statusCode } } };\n}\n\nreturn {\n  json: {\n    ...original,\n    needsFetch: false,\n    recordFetch: {\n      ok: false,\n      statusCode: statusCode || null,\n      category: response.body && response.body.category ? String(response.body.category) : null,\n      message: errorText(response),\n    },\n  },\n};\n"
+      },
+      "id": "5124e465-4db7-5e74-9bb2-b841401aa290",
+      "name": "Merge Fetched Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Gatekeeper · Normalise, Filter & ICP Mode: Run Once for Each Item\n// Normalises the root domain, blocks free/disposable/excluded domains,\n// validates ICP fit, and checks record-level enrichment history.\n// Output decision: candidate | rejected | disqualified | skipped | ignored\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback;\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback;\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback) => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst COOLDOWN_DAYS = Math.max(1, num('ENRICHMENT_COOLDOWN_DAYS', 90));\nconst DEDUPE_SCOPE = env('DEDUPE_SCOPE', 'domain').toLowerCase(); // domain | domain_and_object_type\nconst ICP_MIN_EMPLOYEES = num('ICP_MIN_EMPLOYEES', 20);\nconst ICP_MAX_EMPLOYEES = num('ICP_MAX_EMPLOYEES', 5000);\nconst ICP_ALLOW_UNKNOWN = flag('ICP_ALLOW_UNKNOWN_FIRMOGRAPHICS', true);\n\nconst normIndustry = (v) => String(v || '').trim().toUpperCase().replace(/&/g, 'AND').replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');\nconst COUNTRY_ALIASES = {\n  us: 'united states', usa: 'united states', 'u.s.': 'united states', 'u.s.a.': 'united states', 'united states of america': 'united states',\n  uk: 'united kingdom', gb: 'united kingdom', 'great britain': 'united kingdom', england: 'united kingdom', scotland: 'united kingdom', wales: 'united kingdom',\n  ca: 'canada', au: 'australia', ie: 'ireland', de: 'germany', deutschland: 'germany', nl: 'netherlands', 'the netherlands': 'netherlands', holland: 'netherlands',\n};\nconst normCountry = (v) => {\n  const s = String(v || '').trim().toLowerCase();\n  return COUNTRY_ALIASES[s] || s;\n};\n\nconst ICP_INDUSTRIES = new Set(csv('ICP_INDUSTRIES', '').map(normIndustry));\nconst ICP_EXCLUDED_INDUSTRIES = new Set(\n  csv('ICP_EXCLUDED_INDUSTRIES', 'GOVERNMENT_ADMINISTRATION,NON_PROFIT_ORGANIZATION_MANAGEMENT,EDUCATION_MANAGEMENT').map(normIndustry)\n);\nconst ICP_COUNTRIES = new Set(\n  csv('ICP_COUNTRIES', 'United States,Canada,United Kingdom,Ireland,Australia,Germany,Netherlands').map(normCountry)\n);\n\nconst FREE_EMAIL_DOMAINS = new Set([\n  'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'yahoo.co.in', 'yahoo.fr', 'yahoo.de', 'ymail.com', 'rocketmail.com',\n  'hotmail.com', 'hotmail.co.uk', 'hotmail.fr', 'outlook.com', 'live.com', 'msn.com', 'aol.com', 'icloud.com', 'me.com', 'mac.com',\n  'proton.me', 'protonmail.com', 'pm.me', 'gmx.com', 'gmx.de', 'gmx.net', 'web.de', 'mail.com', 'zoho.com', 'zohomail.com',\n  'yandex.com', 'yandex.ru', 'mail.ru', 'inbox.ru', 'list.ru', 'bk.ru', 'qq.com', '163.com', '126.com', 'sina.com', 'naver.com',\n  'daum.net', 'hanmail.net', 'rediffmail.com', 'fastmail.com', 'hey.com', 'tutanota.com', 'tuta.io', 't-online.de', 'orange.fr',\n  'wanadoo.fr', 'free.fr', 'laposte.net', 'libero.it', 'virgilio.it', 'btinternet.com', 'sky.com', 'comcast.net', 'verizon.net',\n  'att.net', 'sbcglobal.net', 'cox.net', 'bellsouth.net', 'earthlink.net', 'shaw.ca', 'rogers.com', 'sympatico.ca', 'bigpond.com',\n  'optusnet.com.au',\n]);\nconst DISPOSABLE_EMAIL_DOMAINS = new Set([\n  'mailinator.com', 'guerrillamail.com', 'guerrillamail.info', 'sharklasers.com', '10minutemail.com', 'tempmail.com', 'temp-mail.org',\n  'yopmail.com', 'trashmail.com', 'getnada.com', 'maildrop.cc', 'dispostable.com', 'throwawaymail.com', 'fakeinbox.com',\n  'mintemail.com', 'mailnesia.com', 'emailondeck.com', 'moakt.com', 'tempr.email', 'burnermail.io', 'spamgourmet.com', 'mohmal.com',\n  '33mail.com', 'mailcatch.com', 'inboxkitten.com', 'mytemp.email', 'tempail.com', 'emailfake.com', 'discard.email',\n]);\nconst EXTRA_BLOCKED = new Set(csv('EXTRA_BLOCKED_DOMAINS', '').map((d) => d.toLowerCase()));\nconst EXCLUDED_DOMAINS = new Set(csv('EXCLUDED_DOMAINS', '').map((d) => d.toLowerCase())); // your own domain, customers, partners\n\n// Compact list of two-label public suffixes. Extend via EXTRA_MULTI_PART_SUFFIXES.\nconst MULTI_PART_SUFFIXES = new Set([\n  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'ltd.uk', 'plc.uk', 'me.uk', 'com.au', 'net.au', 'org.au', 'co.nz', 'org.nz', 'co.jp',\n  'ne.jp', 'or.jp', 'com.br', 'com.mx', 'com.ar', 'co.za', 'co.in', 'net.in', 'org.in', 'com.sg', 'com.my', 'com.hk', 'com.tr',\n  'com.cn', 'co.kr', 'co.il', 'com.ph', 'com.pk', 'com.bd', 'co.id', 'com.vn', 'com.tw', 'com.ng', 'com.eg', 'com.sa', 'co.th',\n  ...csv('EXTRA_MULTI_PART_SUFFIXES', '').map((s) => s.toLowerCase()),\n]);\n\nfunction rootDomainFrom(input) {\n  if (input === null || input === undefined) return null;\n  let s = String(input).trim().toLowerCase();\n  if (!s) return null;\n  if (s.includes('@')) s = s.split('@').pop();\n  s = s.replace(/^[a-z][a-z0-9+.-]*:\\/\\//, '');\n  s = s.split(/[\\/?#\\s]/)[0];\n  s = s.replace(/^[^@]*@/, '').replace(/:\\d+$/, '').replace(/\\.+$/, '');\n  const labels = s.split('.').filter(Boolean);\n  if (labels.length < 2) return null;\n  if (!labels.every((l) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(l))) return null;\n  const tld = labels[labels.length - 1];\n  if (!/^(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/.test(tld)) return null;\n  const lastTwo = labels.slice(-2).join('.');\n  const take = MULTI_PART_SUFFIXES.has(lastTwo) && labels.length >= 3 ? 3 : 2;\n  if (MULTI_PART_SUFFIXES.has(lastTwo) && labels.length < 3) return null; // bare public suffix\n  return labels.slice(-take).join('.');\n}\n\nfunction parseEmployees(value) {\n  if (value === null || value === undefined || value === '') return null;\n  const s = String(value).replace(/,/g, '').trim();\n  let m = s.match(/^(\\d+)\\s*\\+$/);\n  if (m) return { min: Number(m[1]), max: Infinity };\n  m = s.match(/^(\\d+)\\s*(?:-|–|to)\\s*(\\d+)$/i);\n  if (m) return { min: Number(m[1]), max: Number(m[2]) };\n  if (/^\\d+(?:\\.\\d+)?$/.test(s)) {\n    const n = Math.round(Number(s));\n    return { min: n, max: n };\n  }\n  return null;\n}\n\nconst parseTime = (value) => {\n  if (value === null || value === undefined || value === '') return null;\n  const n = /^\\d+$/.test(String(value)) ? Number(value) : Date.parse(String(value));\n  return Number.isFinite(n) ? n : null;\n};\n\nconst maskEmail = (email) => {\n  const s = String(email || '');\n  const at = s.indexOf('@');\n  return at > 0 ? `${s[0]}***@${s.slice(at + 1).toLowerCase()}` : null;\n};\n\nconst item = $json;\nconst props = item.properties || {};\nconst now = Date.now();\nconst cooldownMs = COOLDOWN_DAYS * 86400000;\nconst cutoffMs = now - cooldownMs;\n\nconst result = {\n  rootDomain: null,\n  domainSource: null,\n  emailMasked: item.objectType === 'contact' ? maskEmail(props.email) : null,\n  firmographics: null,\n  decision: 'candidate',\n  reasonCode: null,\n  reasonDetail: null,\n  writeEligible: false,\n  needsDomainLookup: false,\n  lookupRequest: null,\n  cooldown: { days: COOLDOWN_DAYS, cutoffMs, cutoffIso: new Date(cutoffMs).toISOString() },\n};\nconst finish = (decision, reasonCode, reasonDetail, writeEligible) => {\n  result.decision = decision;\n  result.reasonCode = reasonCode;\n  result.reasonDetail = reasonDetail;\n  result.writeEligible = !!writeEligible;\n  return { json: { ...item, ...result } };\n};\n\n// 1 · Upstream gate results\nif (!item.gate || !item.gate.authOk) return finish('rejected', 'unauthorized', (item.gate && item.gate.rejectReason) || 'auth_failed', false);\nif (item.gate.rejectReason) return finish('rejected', item.gate.rejectReason, 'payload could not be processed', false);\nif (item.gate.ignoreReason) return finish('ignored', item.gate.ignoreReason, item.gate.eventType || null, false);\nif (!item.objectType || !item.objectId) return finish('rejected', 'missing_object_reference', 'objectType or objectId missing', false);\n\nconst idIsNumeric = /^\\d+$/.test(String(item.objectId));\nif (item.recordFetch && !item.recordFetch.ok) {\n  if (item.recordFetch.statusCode === 404) return finish('rejected', 'record_not_found', 'HubSpot returned 404 for this object', false);\n  return finish('skipped', 'record_fetch_failed', `HubSpot fetch failed (${item.recordFetch.statusCode || 'network'})`, false);\n}\nif (!item.properties) return finish('rejected', 'missing_record_properties', SANDBOX_MODE ? 'sandbox events need inline properties' : 'no properties available', idIsNumeric);\n\n// 2 · Root-domain normalisation\nconst sources = item.objectType === 'contact'\n  ? [['email', props.email], ['hs_email_domain', props.hs_email_domain]]\n  : [['domain', props.domain], ['website', props.website]];\nfor (const [source, value] of sources) {\n  const root = rootDomainFrom(value);\n  if (root) { result.rootDomain = root; result.domainSource = source; break; }\n}\nif (!result.rootDomain) {\n  const hadValue = sources.some(([, v]) => v !== null && v !== undefined && String(v).trim() !== '');\n  return finish('rejected', hadValue ? 'invalid_root_domain' : 'missing_domain', `checked: ${sources.map(([s]) => s).join(', ')}`, idIsNumeric);\n}\n\n// 3 · Free / disposable / excluded domains\nconst d = result.rootDomain;\nif (FREE_EMAIL_DOMAINS.has(d)) return finish('rejected', 'free_email_domain', d, true);\nif (DISPOSABLE_EMAIL_DOMAINS.has(d)) return finish('rejected', 'disposable_email_domain', d, true);\nif (EXTRA_BLOCKED.has(d)) return finish('rejected', 'blocked_domain', d, true);\nif (EXCLUDED_DOMAINS.has(d)) return finish('rejected', 'excluded_domain', d, true);\n\n// 4 · ICP fit (unknown values pass when ICP_ALLOW_UNKNOWN_FIRMOGRAPHICS=true)\nconst employeesRaw = item.objectType === 'contact' ? (props.numemployees ?? props.numberofemployees) : (props.numberofemployees ?? props.numemployees);\nconst employees = parseEmployees(employeesRaw);\nconst industry = normIndustry(props.industry);\nconst country = normCountry(props.country);\nresult.firmographics = {\n  employees: employeesRaw ?? null,\n  employeeRange: employees ? { min: employees.min, max: employees.max === Infinity ? null : employees.max } : null,\n  industry: industry || null,\n  country: country || null,\n};\n\nif (!employees) {\n  if (!ICP_ALLOW_UNKNOWN) return finish('disqualified', 'icp_employee_count_unknown', 'employee count missing', true);\n} else {\n  if (employees.max < ICP_MIN_EMPLOYEES) return finish('disqualified', 'icp_employees_below_min', `${employeesRaw} < ${ICP_MIN_EMPLOYEES}`, true);\n  if (employees.min > ICP_MAX_EMPLOYEES) return finish('disqualified', 'icp_employees_above_max', `${employeesRaw} > ${ICP_MAX_EMPLOYEES}`, true);\n}\nif (!industry) {\n  if (!ICP_ALLOW_UNKNOWN && ICP_INDUSTRIES.size) return finish('disqualified', 'icp_industry_unknown', 'industry missing', true);\n} else {\n  if (ICP_EXCLUDED_INDUSTRIES.has(industry)) return finish('disqualified', 'icp_industry_excluded', industry, true);\n  if (ICP_INDUSTRIES.size && !ICP_INDUSTRIES.has(industry)) return finish('disqualified', 'icp_industry_not_allowed', industry, true);\n}\nif (!country) {\n  if (!ICP_ALLOW_UNKNOWN && ICP_COUNTRIES.size) return finish('disqualified', 'icp_country_unknown', 'country missing', true);\n} else if (ICP_COUNTRIES.size && !ICP_COUNTRIES.has(country)) {\n  return finish('disqualified', 'icp_country_not_allowed', country, true);\n}\n\n// 5 · Record-level enrichment history (cheap check before any API call)\nconst status = String(props.clay_enrichment_status || '').toLowerCase();\nconst lastEnriched = parseTime(props.clay_last_enriched_at);\nconst lastDispatched = parseTime(props.clay_last_dispatched_at);\nif (lastEnriched && lastEnriched >= cutoffMs) {\n  return finish('skipped', 'recently_enriched_record', `enriched ${Math.floor((now - lastEnriched) / 86400000)}d ago (cooldown ${COOLDOWN_DAYS}d)`, true);\n}\nif (lastDispatched && lastDispatched >= cutoffMs && ['queued', 'enriched'].includes(status)) {\n  return finish('skipped', 'already_dispatched_record', `dispatched ${Math.floor((now - lastDispatched) / 86400000)}d ago, status ${status}`, true);\n}\n\n// 6 · Candidate: prepare the HubSpot domain cooldown lookup (companies search)\nresult.writeEligible = idIsNumeric;\nresult.needsDomainLookup = !SANDBOX_MODE && (DEDUPE_SCOPE === 'domain' || item.objectType === 'company');\nif (result.needsDomainLookup) {\n  const domainFilter = { propertyName: 'domain', operator: 'EQ', value: d };\n  result.lookupRequest = {\n    filterGroups: [\n      { filters: [domainFilter, { propertyName: 'clay_last_enriched_at', operator: 'GTE', value: String(cutoffMs) }] },\n      { filters: [domainFilter, { propertyName: 'clay_last_dispatched_at', operator: 'GTE', value: String(cutoffMs) }] },\n    ],\n    properties: ['domain', 'clay_enrichment_status', 'clay_last_enriched_at', 'clay_last_dispatched_at'],\n    limit: 5,\n  };\n}\nreturn { json: { ...item, ...result } };\n"
+      },
+      "id": "2462a12c-28a3-5efd-9ac5-470fdbe31b84",
+      "name": "Gatekeeper: Normalise, Filter & ICP",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ],
+      "notes": "Root-domain normalisation, free/disposable filtering, ICP fit, record-level cooldown.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "caac9aa9-6b2a-57cf-8396-2b14dfed37b6",
+              "leftValue": "={{ $json.needsDomainLookup }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "eaec40de-abda-5493-947a-5704c4feca94",
+      "name": "Needs Domain Lookup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com') }}/crm/v3/objects/companies/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.lookupRequest) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "id": "3801f370-7a51-5384-8b73-09375813b25f",
+      "name": "HubSpot Domain Cooldown Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "notes": "CRM search: any company on this root domain enriched or dispatched inside the cooldown window?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Apply Domain Lookup Result           Mode: Run Once for Each Item\n// Fails closed: if the HubSpot search cannot confirm the domain is fresh,\n// the item is skipped so no Clay credits are spent on uncertainty.\n// ─────────────────────────────────────────────────────────────────────\nconst original = $('Needs Domain Lookup?').item.json;\nconst response = $json || {};\nconst statusCode = Number(response.statusCode || 0);\n\nif (statusCode !== 200 || !response.body) {\n  return {\n    json: {\n      ...original,\n      decision: 'skipped',\n      reasonCode: 'domain_lookup_failed',\n      reasonDetail: `HubSpot search returned ${statusCode || 'network error'}; failing closed`,\n      domainLookup: { ok: false, statusCode: statusCode || null },\n    },\n  };\n}\n\nconst results = Array.isArray(response.body.results) ? response.body.results : [];\nconst others = results.filter((r) => String(r.id) !== String(original.objectType === 'company' ? original.objectId : ''));\nconst match = others[0] || results[0] || null;\nconst total = Number(response.body.total || results.length || 0);\n\nif (total > 0 && match) {\n  return {\n    json: {\n      ...original,\n      decision: 'skipped',\n      reasonCode: 'domain_recently_enriched_in_crm',\n      reasonDetail: `company ${match.id} with domain ${original.rootDomain} was enriched or dispatched inside the cooldown window`,\n      domainLookup: { ok: true, statusCode, total, matchedCompanyId: String(match.id) },\n    },\n  };\n}\n\nreturn { json: { ...original, domainLookup: { ok: true, statusCode, total: 0, matchedCompanyId: null } } };\n"
+      },
+      "id": "c6fcb238-5ad0-5294-8641-7e83a398df02",
+      "name": "Apply Domain Lookup Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Credit Guard · Ledger & Daily Budget Mode: Run Once for All Items\n// Enforces the rolling domain dedupe ledger and the daily credit cap, then\n// reserves credits for every item it routes to Clay.\n// Persistence: only when DRY_RUN=false AND SANDBOX_MODE=false. Otherwise a\n// shadow copy is used so dedupe and cap behaviour can still be observed.\n// Routes: clay_live | clay_dry_run | skip\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback;\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback;\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst PERSIST = !DRY_RUN && !SANDBOX_MODE;\nconst COOLDOWN_DAYS = Math.max(1, num('ENRICHMENT_COOLDOWN_DAYS', 90));\nconst DEDUPE_SCOPE = env('DEDUPE_SCOPE', 'domain').toLowerCase();\nconst DAILY_BUDGET = Math.max(0, SANDBOX_MODE ? num('SANDBOX_DAILY_CREDIT_BUDGET', 10) : num('DAILY_CREDIT_BUDGET', 150));\nconst COST = {\n  company: Math.max(0, num('CREDIT_COST_COMPANY', 3)),\n  contact: Math.max(0, num('CREDIT_COST_CONTACT', 5)),\n};\nconst LEDGER_MAX_ENTRIES = Math.max(100, num('LEDGER_MAX_ENTRIES', 20000));\nconst BUDGET_TIMEZONE = env('BUDGET_TIMEZONE', 'UTC');\nconst SEND_NAMES = flag('CLAY_SEND_CONTACT_NAMES', false);\n\nconst dayKeyFor = (date) => {\n  try {\n    return new Intl.DateTimeFormat('en-CA', { timeZone: BUDGET_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);\n  } catch (error) {\n    return date.toISOString().slice(0, 10); // invalid timezone -> UTC\n  }\n};\n\nconst now = new Date();\nconst nowMs = now.getTime();\nconst today = dayKeyFor(now);\nconst cooldownMs = COOLDOWN_DAYS * 86400000;\n\n// ── State: real static data (live) or an isolated shadow copy ──────────\nconst staticData = $getWorkflowStaticData('global');\nconst emptyState = () => ({ version: 1, ledger: {}, budget: { dayKey: today, spent: 0, dispatched: 0, blocked: 0 } });\nlet state;\nif (PERSIST) {\n  if (!staticData.clayCreditGuard || staticData.clayCreditGuard.version !== 1) staticData.clayCreditGuard = emptyState();\n  state = staticData.clayCreditGuard;\n} else if (SANDBOX_MODE) {\n  state = emptyState(); // deterministic fixtures every run\n} else {\n  state = JSON.parse(JSON.stringify(staticData.clayCreditGuard || emptyState())); // shadow mode: real history, no writes\n}\n\n// Roll the budget at the start of a new budget day\nif (!state.budget || state.budget.dayKey !== today) state.budget = { dayKey: today, spent: 0, dispatched: 0, blocked: 0 };\n\n// Prune expired ledger entries and cap ledger size\nfor (const [key, entry] of Object.entries(state.ledger)) {\n  if (!entry || typeof entry.at !== 'number' || nowMs - entry.at >= cooldownMs) delete state.ledger[key];\n}\nconst keys = Object.keys(state.ledger);\nif (keys.length > LEDGER_MAX_ENTRIES) {\n  keys.sort((a, b) => state.ledger[a].at - state.ledger[b].at)\n    .slice(0, keys.length - LEDGER_MAX_ENTRIES)\n    .forEach((k) => delete state.ledger[k]);\n}\n\nconst ledgerKeyFor = (item) => (DEDUPE_SCOPE === 'domain_and_object_type' ? `${item.objectType}:${item.rootDomain}` : item.rootDomain);\n\nconst buildClayPayload = (item, cost, idempotencyKey) => {\n  const p = item.properties || {};\n  const payload = {\n    source: 'n8n-clay-webhook-enrichment-credit-guard',\n    schema_version: 1,\n    run_id: item.gate.runId,\n    idempotency_key: idempotencyKey,\n    object_type: item.objectType,\n    hubspot_object_id: String(item.objectId),\n    root_domain: item.rootDomain,\n    company_name: (item.objectType === 'company' ? p.name : p.company) || null,\n    website: p.website || (item.rootDomain ? `https://${item.rootDomain}` : null),\n    hints: {\n      employees: item.firmographics ? item.firmographics.employees : null,\n      industry: item.firmographics ? item.firmographics.industry : null,\n      country: item.firmographics ? item.firmographics.country : null,\n    },\n    credit_guard: { day_key: today, estimated_credit_cost: cost },\n    requested_at: now.toISOString(),\n  };\n  if (item.objectType === 'contact') {\n    payload.contact_email = p.email ? String(p.email).trim().toLowerCase() : null;\n    if (SEND_NAMES) {\n      payload.first_name = p.firstname || null;\n      payload.last_name = p.lastname || null;\n      payload.job_title = p.jobtitle || null;\n    }\n  }\n  return payload;\n};\n\nconst output = [];\nfor (const input of $input.all()) {\n  const item = input.json;\n  const snapshot = () => ({\n    dayKey: state.budget.dayKey,\n    timezone: BUDGET_TIMEZONE,\n    dailyBudget: DAILY_BUDGET,\n    spentAfter: state.budget.spent,\n    remaining: Math.max(0, DAILY_BUDGET - state.budget.spent),\n    persisted: PERSIST,\n    stateMode: PERSIST ? 'live_static_data' : SANDBOX_MODE ? 'sandbox_ephemeral' : 'shadow_copy',\n  });\n\n  if (item.decision !== 'candidate') {\n    output.push({ json: { ...item, route: 'skip', creditGuard: { ...snapshot(), cost: 0, evaluated: false } } });\n    continue;\n  }\n\n  const ledgerKey = ledgerKeyFor(item);\n  const existing = state.ledger[ledgerKey];\n  if (existing) {\n    const inBatch = existing.runBatch === $execution.id;\n    output.push({\n      json: {\n        ...item,\n        decision: 'skipped',\n        reasonCode: inBatch ? 'duplicate_domain_in_batch' : 'duplicate_domain_ledger',\n        reasonDetail: `${ledgerKey} reserved ${Math.round((nowMs - existing.at) / 3600000)}h ago by ${existing.objectType} ${existing.objectId}`,\n        route: 'skip',\n        creditGuard: { ...snapshot(), cost: 0, evaluated: true, ledgerKey },\n      },\n    });\n    continue;\n  }\n\n  const cost = COST[item.objectType] ?? COST.company;\n  if (state.budget.spent + cost > DAILY_BUDGET) {\n    state.budget.blocked += 1;\n    output.push({\n      json: {\n        ...item,\n        decision: 'skipped',\n        reasonCode: 'daily_credit_cap_reached',\n        reasonDetail: `needs ${cost}, ${Math.max(0, DAILY_BUDGET - state.budget.spent)} of ${DAILY_BUDGET} left for ${today}`,\n        route: 'skip',\n        creditGuard: { ...snapshot(), cost, evaluated: true, ledgerKey },\n      },\n    });\n    continue;\n  }\n\n  // Reserve credits and the ledger slot before dispatching\n  state.budget.spent += cost;\n  state.budget.dispatched += 1;\n  state.ledger[ledgerKey] = {\n    at: nowMs,\n    objectType: item.objectType,\n    objectId: String(item.objectId),\n    runId: item.gate.runId,\n    runBatch: $execution.id,\n    cost,\n    status: 'reserved',\n  };\n  const idempotencyKey = `${item.objectType}:${item.objectId}:${today}`;\n  output.push({\n    json: {\n      ...item,\n      decision: 'dispatch',\n      reasonCode: null,\n      reasonDetail: 'net-new, ICP-qualified, inside daily budget',\n      route: PERSIST ? 'clay_live' : 'clay_dry_run',\n      idempotencyKey,\n      clayPayload: buildClayPayload(item, cost, idempotencyKey),\n      creditGuard: { ...snapshot(), cost, evaluated: true, ledgerKey },\n    },\n  });\n}\n\nreturn output;\n"
+      },
+      "id": "560e4830-3be1-5b93-81a4-fc4c8fc52018",
+      "name": "Credit Guard: Ledger & Daily Budget",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        300
+      ],
+      "notes": "Rolling dedupe ledger + daily credit cap in workflow static data. Reserves credits before dispatch.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "ef405594-38e7-5dcd-af12-bf3a66259a35",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "clay_live",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "clay_live"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cd2e20e2-ae3b-549a-954a-2f12c93da54e",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "clay_dry_run",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "clay_dry_run"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "skip_or_reject"
+        }
+      },
+      "id": "a49fa0e1-f488-5a6e-a11a-a8ad23c4ff54",
+      "name": "Route Decision",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        2400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.objectType === 'contact' ? ($env.CLAY_CONTACT_TABLE_WEBHOOK_URL || $env.CLAY_TABLE_WEBHOOK_URL) : ($env.CLAY_COMPANY_TABLE_WEBHOOK_URL || $env.CLAY_TABLE_WEBHOOK_URL) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-clay-webhook-auth",
+              "value": "={{ $env.CLAY_WEBHOOK_AUTH_TOKEN || 'YOUR_CLAY_WEBHOOK_AUTH_TOKEN' }}"
+            },
+            {
+              "name": "X-Idempotency-Key",
+              "value": "={{ $json.idempotencyKey }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.clayPayload) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "6d2b4938-2bc6-505d-8580-77ed2416a9e3",
+      "name": "Dispatch to Clay Table",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2640,
+        80
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Live only (DRY_RUN=false and SANDBOX_MODE=false). URL and auth come from env and are never written to item data."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Record Clay Dispatch                 Mode: Run Once for Each Item\n// Clay accepted the row. Marks the ledger reservation as dispatched.\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Route Decision').item.json;\nconst response = $json || {};\n\ntry {\n  if (ctx.creditGuard && ctx.creditGuard.persisted) {\n    const store = $getWorkflowStaticData('global').clayCreditGuard;\n    const entry = store && store.ledger ? store.ledger[ctx.creditGuard.ledgerKey] : null;\n    if (entry && entry.runId === ctx.gate.runId) {\n      entry.status = 'dispatched';\n      entry.dispatchedAt = Date.now();\n    }\n  }\n} catch (error) {\n  // Ledger bookkeeping must never block the HubSpot status update.\n}\n\nreturn {\n  json: {\n    ...ctx,\n    outcomeStatus: 'queued',\n    dispatch: {\n      mode: 'live',\n      simulated: false,\n      ok: true,\n      statusCode: Number(response.statusCode || 200),\n      at: new Date().toISOString(),\n    },\n  },\n};\n"
+      },
+      "id": "0fcdb04c-6610-5faa-a87e-4ff5ac5798b9",
+      "name": "Record Clay Dispatch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitize Clay Error & Refund Credits Mode: Run Once for Each Item\n// Clay rejected the row after all retries. Redacts the error, releases the\n// credit reservation and the ledger slot so a later event can retry.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback;\n  }\n};\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'CLAY_WEBHOOK_AUTH_TOKEN', 'WEBHOOK_SHARED_SECRET', 'HUBSPOT_APP_CLIENT_SECRET',\n  'CLAY_TABLE_WEBHOOK_URL', 'CLAY_COMPANY_TABLE_WEBHOOK_URL', 'CLAY_CONTACT_TABLE_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst redactString = (input) => {\n  let s = String(input);\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https?:\\/\\/[^\\s\"']*clay\\.com[^\\s\"']*/gi, '[REDACTED_CLAY_URL]')\n    .replace(/([?&](?:hapikey|api_key|apikey|token|key|secret)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 500);\n};\n\nconst ctx = $('Route Decision').item.json;\nconst err = $json.error ?? $json;\nconst message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'clay_dispatch_failed';\nconst httpCode = (err && (err.httpCode || err.statusCode || err.status)) || null;\n\nlet refunded = false;\ntry {\n  if (ctx.creditGuard && ctx.creditGuard.persisted) {\n    const store = $getWorkflowStaticData('global').clayCreditGuard;\n    if (store) {\n      const entry = store.ledger ? store.ledger[ctx.creditGuard.ledgerKey] : null;\n      if (entry && entry.runId === ctx.gate.runId) delete store.ledger[ctx.creditGuard.ledgerKey];\n      if (store.budget && store.budget.dayKey === ctx.creditGuard.dayKey) {\n        store.budget.spent = Math.max(0, store.budget.spent - (ctx.creditGuard.cost || 0));\n        store.budget.dispatched = Math.max(0, (store.budget.dispatched || 1) - 1);\n        refunded = true;\n      }\n    }\n  }\n} catch (error) {\n  refunded = false;\n}\n\nreturn {\n  json: {\n    ...ctx,\n    clayPayload: undefined,\n    outcomeStatus: 'dispatch_failed',\n    reasonCode: 'clay_dispatch_failed',\n    reasonDetail: redactString(message),\n    dispatch: {\n      mode: 'live',\n      simulated: false,\n      ok: false,\n      httpCode: httpCode ? String(httpCode) : null,\n      creditsRefunded: refunded,\n      at: new Date().toISOString(),\n    },\n  },\n};\n"
+      },
+      "id": "23a4371d-27db-5486-b7d7-7da8b6dacc21",
+      "name": "Sanitize Clay Error & Refund Credits",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Clay Dispatch (Dry Run)     Mode: Run Once for Each Item\n// No network call. Shows which table would be used and a masked preview.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nconst preview = { ...(item.clayPayload || {}) };\nif (preview.contact_email) {\n  const [local, domain] = String(preview.contact_email).split('@');\n  preview.contact_email = `${(local || '?')[0]}***@${domain || ''}`;\n}\nconst targetVar = item.objectType === 'contact' ? 'CLAY_CONTACT_TABLE_WEBHOOK_URL' : 'CLAY_COMPANY_TABLE_WEBHOOK_URL';\n\nreturn {\n  json: {\n    ...item,\n    outcomeStatus: 'dry_run',\n    dispatch: {\n      mode: item.gate && item.gate.sandboxMode ? 'sandbox' : 'dry_run',\n      simulated: true,\n      ok: true,\n      wouldPostTo: `${targetVar} (fallback CLAY_TABLE_WEBHOOK_URL)`,\n      payloadPreview: preview,\n      at: new Date().toISOString(),\n    },\n  },\n};\n"
+      },
+      "id": "8c9cb5e1-8490-50f4-bceb-53e7d9387cb1",
+      "name": "Simulate Clay Dispatch (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build HubSpot Status Update          Mode: Run Once for Each Item\n// Maps every outcome to HubSpot enrichment-status properties and decides\n// whether a live PATCH is allowed (never in DRY_RUN or SANDBOX_MODE).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback;\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst WRITE_SKIPS = flag('WRITE_SKIP_STATUS_TO_HUBSPOT', true);\n\nconst item = $json;\nconst nowIso = new Date().toISOString();\n\nlet status;\nif (item.decision === 'dispatch') status = item.outcomeStatus || 'dry_run'; // queued | dispatch_failed | dry_run\nelse if (item.decision === 'rejected') status = 'rejected';\nelse if (item.decision === 'disqualified') status = 'disqualified';\nelse if (item.decision === 'skipped') status = 'skipped';\nelse status = 'ignored';\n\nconst properties = {\n  clay_enrichment_status: status,\n  clay_enrichment_skip_reason: item.reasonCode || '',\n  clay_enrichment_root_domain: item.rootDomain || '',\n  clay_enrichment_checked_at: nowIso,\n  clay_enrichment_run_id: (item.gate && item.gate.runId) || '',\n};\nif (status === 'queued') properties.clay_last_dispatched_at = nowIso;\n\nlet hubspotWrite;\nif (!item.writeEligible || status === 'ignored' || !/^\\d+$/.test(String(item.objectId || ''))) hubspotWrite = 'not_applicable';\nelse if (SANDBOX_MODE || DRY_RUN || status === 'dry_run') hubspotWrite = 'dry_run';\nelse if (!WRITE_SKIPS && !['queued', 'dispatch_failed'].includes(status)) hubspotWrite = 'disabled_for_skips';\nelse hubspotWrite = 'live';\n\nreturn {\n  json: {\n    ...item,\n    clayPayload: undefined, // keep PII out of downstream execution data\n    status,\n    hubspotWrite,\n    hubspotObjectPath: item.objectType === 'contact' ? 'contacts' : 'companies',\n    hubspotProperties: properties,\n  },\n};\n"
+      },
+      "id": "111a2ce9-d265-5938-aa39-1e0de66ac942",
+      "name": "Build HubSpot Status Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d02afb25-7c72-58ba-af07-7651669ebf6d",
+              "leftValue": "={{ $json.hubspotWrite }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5306c663-96e4-5c6d-9642-30983f1b90a1",
+      "name": "Write to HubSpot?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ ($env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com') }}/crm/v3/objects/{{ $json.hubspotObjectPath }}/{{ encodeURIComponent($json.objectId) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: $json.hubspotProperties }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "a1d79deb-e0ab-5269-9b31-aefffe2b4de7",
+      "name": "Update HubSpot Enrichment Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3600,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "PATCH clay_enrichment_status / skip reason / root domain / timestamps."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Confirm HubSpot Write                Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Build HubSpot Status Update').item.json;\nreturn {\n  json: {\n    ...ctx,\n    hubspotWriteResult: { ok: true, mode: 'live', updatedAt: ($json && $json.updatedAt) || new Date().toISOString() },\n  },\n};\n"
+      },
+      "id": "0dcfb8a8-9eda-57d7-b4e0-12685158e376",
+      "name": "Confirm HubSpot Write",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitize HubSpot Error               Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback;\n  }\n};\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'CLAY_WEBHOOK_AUTH_TOKEN', 'WEBHOOK_SHARED_SECRET', 'HUBSPOT_APP_CLIENT_SECRET']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst redactString = (input) => {\n  let s = String(input);\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 500);\n};\n\nconst ctx = $('Build HubSpot Status Update').item.json;\nconst err = $json.error ?? $json;\nconst message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'hubspot_update_failed';\nconst httpCode = (err && (err.httpCode || err.statusCode || err.status)) || null;\n\nreturn {\n  json: {\n    ...ctx,\n    hubspotWriteResult: {\n      ok: false,\n      mode: 'live',\n      httpCode: httpCode ? String(httpCode) : null,\n      hint: String(httpCode) === '400' ? 'check that every clay_* property and enumeration option exists' : null,\n      message: redactString(message),\n    },\n  },\n};\n"
+      },
+      "id": "e0968383-aa53-5674-9803-3f16b6f54056",
+      "name": "Sanitize HubSpot Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                         Mode: Run Once for Each Item\n// Emits one redacted, structured audit record per HubSpot object, writes it\n// to stdout as a JSON line, and keeps a small ring buffer in static data.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback;\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback;\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 200));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\n\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'CLAY_WEBHOOK_AUTH_TOKEN', 'WEBHOOK_SHARED_SECRET', 'HUBSPOT_APP_CLIENT_SECRET',\n  'CLAY_TABLE_WEBHOOK_URL', 'CLAY_COMPANY_TABLE_WEBHOOK_URL', 'CLAY_CONTACT_TABLE_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|x-clay-webhook-auth|client[-_]?secret)/i;\nconst redactString = (input) => {\n  let s = String(input);\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https?:\\/\\/[^\\s\"']*clay\\.com[^\\s\"']*/gi, '[REDACTED_CLAY_URL]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 6) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 50).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst item = $json;\nconst gate = item.gate || {};\nconst record = redact({\n  auditVersion: 1,\n  at: new Date().toISOString(),\n  workflowId: $workflow.id || null,\n  executionId: $execution.id || null,\n  runId: gate.runId || null,\n  mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live',\n  auth: { ok: !!gate.authOk, method: gate.authMethod || null },\n  event: { shape: gate.payloadShape || null, type: gate.eventType || null, id: gate.eventId || null, occurredAt: gate.occurredAt || null },\n  objectType: item.objectType || null,\n  objectId: item.objectId || null,\n  rootDomain: item.rootDomain || null,\n  domainSource: item.domainSource || null,\n  emailMasked: item.emailMasked || null,\n  firmographics: item.firmographics || null,\n  decision: item.decision || null,\n  status: item.status || null,\n  reasonCode: item.reasonCode || null,\n  reasonDetail: item.reasonDetail || null,\n  domainLookup: item.domainLookup || null,\n  credit: item.creditGuard\n    ? {\n        dayKey: item.creditGuard.dayKey,\n        cost: item.creditGuard.cost,\n        spentAfter: item.creditGuard.spentAfter,\n        remaining: item.creditGuard.remaining,\n        dailyBudget: item.creditGuard.dailyBudget,\n        stateMode: item.creditGuard.stateMode,\n      }\n    : null,\n  dispatch: item.dispatch\n    ? { mode: item.dispatch.mode, ok: item.dispatch.ok, simulated: item.dispatch.simulated, httpCode: item.dispatch.httpCode || null, creditsRefunded: item.dispatch.creditsRefunded ?? null }\n    : null,\n  hubspot: { write: item.hubspotWrite || null, result: item.hubspotWriteResult || null, properties: item.hubspotProperties || null },\n});\n\nif (LOG_TO_STDOUT) {\n  try { console.log(`[clay-credit-guard] ${JSON.stringify(record)}`); } catch (error) { /* logging is best effort */ }\n}\n\nif (RING_SIZE > 0 && !SANDBOX_MODE) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    if (!Array.isArray(store.clayCreditGuardAudit)) store.clayCreditGuardAudit = [];\n    store.clayCreditGuardAudit.push(record);\n    if (store.clayCreditGuardAudit.length > RING_SIZE) store.clayCreditGuardAudit.splice(0, store.clayCreditGuardAudit.length - RING_SIZE);\n  } catch (error) { /* static data is unavailable in some manual runs */ }\n}\n\nreturn { json: record };\n"
+      },
+      "id": "3c5c8a1b-f9af-5967-a896-7e07ed3d1718",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        300
+      ],
+      "notes": "One redacted JSON audit record per object. stdout + static-data ring buffer.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {},
+      "id": "da35a445-2a68-55d3-817a-f5a7c372f57b",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        720
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow (Workflow settings)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces, redacts secrets and emails, and emits a safe alert.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback;\n  }\n};\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'CLAY_WEBHOOK_AUTH_TOKEN', 'WEBHOOK_SHARED_SECRET', 'HUBSPOT_APP_CLIENT_SECRET',\n  'CLAY_TABLE_WEBHOOK_URL', 'CLAY_COMPANY_TABLE_WEBHOOK_URL', 'CLAY_CONTACT_TABLE_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https?:\\/\\/[^\\s\"']*clay\\.com[^\\s\"']*/gi, '[REDACTED_CLAY_URL]')\n    .replace(/([?&](?:hapikey|api_key|apikey|token|key|secret)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 500);\n};\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || json.trigger?.error || {};\n  const alert = {\n    alertType: 'clay_credit_guard_workflow_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow?.id || null, name: redactString(json.workflow?.name || '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error'),\n    // Stack traces, request options and headers are deliberately not forwarded.\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[clay-credit-guard:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  return { json: alert };\n});\n"
+      },
+      "id": "9574228c-5758-5d72-a2ad-00864108cd50",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## n8n-clay-webhook-enrichment-credit-guard\nPre-enrichment gatekeeper between HubSpot and Clay. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. Nothing leaves n8n until both are `false`.\n\n**Stage 1** Execute with pinned fixtures (13 fictional calls).\n**Stage 2** `SANDBOX_MODE=false`, `DRY_RUN=true`: real HubSpot reads, no writes, no Clay calls.\n**Stage 3** `DRY_RUN=false` with a low `DAILY_CREDIT_BUDGET`.\n\nSet this workflow as its own Error Workflow in Settings. See README.md.",
+        "height": 300,
+        "width": 620,
+        "color": 4
+      },
+      "id": "30d537d6-329d-5ebc-9c8d-3dd24b36dfb1",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Credit guard\nLedger + budget live in workflow static data, which n8n saves only for **production** (active) executions. Run one execution at a time (queue concurrency 1) or move the ledger to Redis/Postgres for parallel workers.",
+        "height": 180,
+        "width": 420,
+        "color": 3
+      },
+      "id": "48fb8dcf-dbdf-55f2-be61-01e15f96e7b7",
+      "name": "Sticky: Credit Guard",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2120,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nStack traces, headers and request options are dropped. Tokens, Clay URLs and emails are redacted.",
+        "height": 80,
+        "width": 520,
+        "color": 2
+      },
+      "id": "96959a98-cc65-56b9-8adc-6222be32e172",
+      "name": "Sticky: Error Handling",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        620
+      ]
+    }
+  ],
+  "connections": {
+    "HubSpot Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse & Authenticate Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Authenticate Events": {
+      "main": [
+        [
+          {
+            "node": "Needs Record Fetch?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Record Fetch?": {
+      "main": [
+        [
+          {
+            "node": "Fetch HubSpot Record",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gatekeeper: Normalise, Filter & ICP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch HubSpot Record": {
+      "main": [
+        [
+          {
+            "node": "Merge Fetched Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Fetched Record": {
+      "main": [
+        [
+          {
+            "node": "Gatekeeper: Normalise, Filter & ICP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gatekeeper: Normalise, Filter & ICP": {
+      "main": [
+        [
+          {
+            "node": "Needs Domain Lookup?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Domain Lookup?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Domain Cooldown Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Credit Guard: Ledger & Daily Budget",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Domain Cooldown Lookup": {
+      "main": [
+        [
+          {
+            "node": "Apply Domain Lookup Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Domain Lookup Result": {
+      "main": [
+        [
+          {
+            "node": "Credit Guard: Ledger & Daily Budget",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Credit Guard: Ledger & Daily Budget": {
+      "main": [
+        [
+          {
+            "node": "Route Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Decision": {
+      "main": [
+        [
+          {
+            "node": "Dispatch to Clay Table",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Clay Dispatch (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build HubSpot Status Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch to Clay Table": {
+      "main": [
+        [
+          {
+            "node": "Record Clay Dispatch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitize Clay Error & Refund Credits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Clay Dispatch": {
+      "main": [
+        [
+          {
+            "node": "Build HubSpot Status Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Clay Error & Refund Credits": {
+      "main": [
+        [
+          {
+            "node": "Build HubSpot Status Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Clay Dispatch (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Build HubSpot Status Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build HubSpot Status Update": {
+      "main": [
+        [
+          {
+            "node": "Write to HubSpot?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write to HubSpot?": {
+      "main": [
+        [
+          {
+            "node": "Update HubSpot Enrichment Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update HubSpot Enrichment Status": {
+      "main": [
+        [
+          {
+            "node": "Confirm HubSpot Write",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitize HubSpot Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm HubSpot Write": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize HubSpot Error": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "HubSpot Webhook Trigger": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "COMPANY",
+            "objectId": 90000000001,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT dispatch (valid ICP company, subdomain + path normalised, 3 credits)",
+            "properties": {
+              "name": "Brightforge Analytics",
+              "domain": "",
+              "website": "https://www.app.brightforge-analytics.example/pricing?utm_source=newsletter",
+              "numberofemployees": "240",
+              "industry": "COMPUTER_SOFTWARE",
+              "country": "United States"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "CONTACT",
+            "objectId": 90000000102,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT dispatch (valid ICP contact, range overlap, country alias CA, 5 credits)",
+            "properties": {
+              "email": "maya.okafor@larkspur-robotics.example",
+              "firstname": "Maya",
+              "lastname": "Okafor",
+              "jobtitle": "VP Revenue Operations",
+              "company": "Larkspur Robotics",
+              "numemployees": "50-100",
+              "industry": "Industrial Automation",
+              "country": "CA"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "CONTACT",
+            "objectId": 90000000103,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT rejected free_email_domain",
+            "properties": {
+              "email": "sandbox.fixture.jordan@gmail.com",
+              "firstname": "Jordan",
+              "lastname": "Fixture",
+              "numemployees": "",
+              "country": "United States"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "CONTACT",
+            "objectId": 90000000104,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT rejected disposable_email_domain",
+            "properties": {
+              "email": "fixture.temp@mailinator.com",
+              "firstname": "Temp",
+              "lastname": "Fixture"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "CONTACT",
+            "objectId": 90000000105,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT skipped duplicate_domain_in_batch (same root domain as fixture 1)",
+            "properties": {
+              "email": "priya.raman@brightforge-analytics.example",
+              "firstname": "Priya",
+              "lastname": "Raman",
+              "company": "Brightforge Analytics",
+              "numemployees": "100-250",
+              "industry": "Computer Software",
+              "country": "USA"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "COMPANY",
+            "objectId": 90000000006,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT disqualified icp_employees_below_min",
+            "properties": {
+              "name": "Tinyloop Studio",
+              "domain": "tinyloop-studio.example",
+              "numberofemployees": "4",
+              "industry": "DESIGN",
+              "country": "United Kingdom"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "COMPANY",
+            "objectId": 90000000007,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT disqualified icp_country_not_allowed",
+            "properties": {
+              "name": "Ventura Cacau Ltda",
+              "domain": "ventura-cacau.example",
+              "numberofemployees": "300",
+              "industry": "FOOD_PRODUCTION",
+              "country": "Brazil"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "COMPANY",
+            "objectId": 90000000008,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT disqualified icp_industry_excluded",
+            "properties": {
+              "name": "Civic Ledger Office",
+              "domain": "civicledger-office.example",
+              "numberofemployees": "800",
+              "industry": "Government Administration",
+              "country": "United Kingdom"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "COMPANY",
+            "objectId": 90000000009,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT skipped recently_enriched_record (12 days ago, 90-day cooldown)",
+            "properties": {
+              "name": "Northpine Freight",
+              "domain": "northpine-freight.example",
+              "numberofemployees": "1200",
+              "industry": "LOGISTICS_AND_SUPPLY_CHAIN",
+              "country": "Canada",
+              "clay_enrichment_status": "enriched",
+              "clay_last_enriched_at": "SANDBOX_DAYS_AGO:12"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "COMPANY",
+            "objectId": 90000000010,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT skipped daily_credit_cap_reached (8 of 10 sandbox credits used, needs 3)",
+            "properties": {
+              "name": "Quarry Peak Systems",
+              "domain": "quarrypeak-systems.example",
+              "numberofemployees": "450",
+              "industry": "COMPUTER_SOFTWARE",
+              "country": "Germany"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "CONTACT",
+            "objectId": 90000000111,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT skipped daily_credit_cap_reached (needs 5)",
+            "properties": {
+              "email": "theo.marsh@saltmarsh-health.example",
+              "firstname": "Theo",
+              "lastname": "Marsh",
+              "company": "Saltmarsh Health",
+              "numemployees": "100-250",
+              "industry": "HOSPITAL_AND_HEALTH_CARE",
+              "country": "Ireland"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "sandbox-fictional-secret-not-for-production"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "COMPANY",
+            "objectId": 90000000012,
+            "eventType": "workflow.enrollment",
+            "fixtureNote": "EXPECT rejected invalid_root_domain",
+            "properties": {
+              "name": "Placeholder Holdings",
+              "domain": "",
+              "website": "n/a",
+              "numberofemployees": "60",
+              "country": "United States"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "HubSpot-Workflow-Webhook (fictional sandbox fixture)",
+            "x-webhook-secret": "wrong-secret-fixture"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "objectType": "COMPANY",
+            "objectId": 90000000013,
+            "fixtureNote": "EXPECT rejected unauthorized (wrong shared secret)",
+            "properties": {
+              "name": "Spoofed Request Co",
+              "domain": "spoofed-request.example"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-clay-credit-guard",
+          "executionMode": "test"
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
