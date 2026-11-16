@@ -53,6 +53,8 @@ This workflow puts one deterministic gate in front of Clay. Every HubSpot object
 
 ## 2. Architecture
 
+![n8n Clay Webhook Enrichment Credit Guard Architecture](./workflow-overview.png)
+
 ```mermaid
 flowchart TD
     A["HubSpot Webhook Trigger"] --> B["Parse & Authenticate Events"]
